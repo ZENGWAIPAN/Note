@@ -1,0 +1,203 @@
+# %%
+import torch
+import torch.nn as nn
+import math # 用於計算 sqrt
+
+# 設定隨機數種子
+def set_seed(seed_value=42):
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# 檢查是否有可用的 GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用的設備: {device}")
+
+# %% [markdown]
+# ## 2. Scaled Dot-Product Attention 機制實現
+#
+# Scaled Dot-Product Attention 的計算步驟：
+# 1. 計算 Query (Q) 和 Key (K) 的點積。
+# 2. 將點積結果除以 Key 向量維度的平方根 (`d_k` 的平方根)。
+# 3. (可選) 應用掩碼 (Mask) - 用於處理變長序列或防止信息洩漏 (如在 Decoder 中)。
+# 4. 對結果應用 Softmax 得到注意力權重。
+# 5. 將注意力權重與 Value (V) 相乘，得到最終的加權求和輸出。
+
+# %%
+class ScaledDotProductAttention(nn.Module):
+    """
+    實現 Scaled Dot-Product Attention 機制
+    """
+    def __init__(self, dropout_p=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, q, k, v, mask=None):
+        """
+        前向傳播函數
+
+        Args:
+            q (torch.Tensor): Query 張量，形狀通常為 (Batch, Heads, SeqLen_Q, Dim_k) 或 (Batch, SeqLen_Q, Dim_k)
+                              對於單頭注意力，Heads 維度為 1 或省略。
+            k (torch.Tensor): Key 張量，形狀通常為 (Batch, Heads, SeqLen_K, Dim_k) 或 (Batch, SeqLen_K, Dim_k)
+                              Dim_k 是 Key 的向量維度。
+            v (torch.Tensor): Value 張量，形狀通常為 (Batch, Heads, SeqLen_V, Dim_v) 或 (Batch, SeqLen_V, Dim_v)
+                              SeqLen_K 和 SeqLen_V 通常相等。Dim_v 是 Value 的向量維度。
+            mask (torch.Tensor, optional): 掩碼張量。形狀通常為 (Batch, 1, 1, SeqLen_K) 或 (Batch, 1, SeqLen_Q, SeqLen_K)。
+                                          用於在 Softmax 之前屏蔽掉某些位置的分數 (設為負無窮大)。
+                                          Defaults to None.
+
+        Returns:
+            tuple: (output, attention_weights)
+                   output (torch.Tensor): 注意力輸出的加權求和，形狀同 V 但 SeqLen 是 SeqLen_Q，即 (Batch, Heads, SeqLen_Q, Dim_v)
+                                          或 (Batch, SeqLen_Q, Dim_v)。
+                   attention_weights (torch.Tensor): 注意力權重，形狀為 (Batch, Heads, SeqLen_Q, SeqLen_K) 或 (Batch, SeqLen_Q, SeqLen_K)。
+        """
+        # 1. 計算 Q 和 K 的點積 (Q @ K^T)
+        # K.transpose(-1, -2) 對 K 的最後兩個維度進行轉置
+        # 例如，如果 K 是 (Batch, SeqLen_K, Dim_k)，轉置後是 (Batch, Dim_k, SeqLen_K)
+        # 矩陣乘法: (Batch, SeqLen_Q, Dim_k) @ (Batch, Dim_k, SeqLen_K) -> (Batch, SeqLen_Q, SeqLen_K)
+        # 如果考慮 Heads: (Batch, Heads, SeqLen_Q, Dim_k) @ (Batch, Heads, Dim_k, SeqLen_K) -> (Batch, Heads, SeqLen_Q, SeqLen_K)
+        qk_scores = torch.matmul(q, k.transpose(-1, -2))
+
+        # 2. 縮放
+        # 獲取 Key 向量的維度 (倒數第二個維度的大小，因為最後一個維度是 SeqLen_K 轉置來的)
+        # 或者更常見地，獲取 K 的最後一個維度的大小 (原始 Dim_k)
+        d_k = k.size(-1)
+        # print(f"d_k: {d_k}") # 打印方便理解
+
+        # 將分數除以 sqrt(d_k)
+        scaled_qk_scores = qk_scores / math.sqrt(d_k)
+
+        # 3. (可選) 應用掩碼
+        if mask is not None:
+            # mask 通常是一個布爾張量 (True 表示保留，False 表示掩碼)
+            # 或者是一個 float 張量 (1 表示保留，0 表示掩碼)
+            # 我們需要將掩碼區域的分數設為一個非常小的負數，這樣在 Softmax 後對應的權重就趨近於 0
+            # 假設 mask 是 0/1 張量，0 表示需要掩碼
+            scaled_qk_scores = scaled_qk_scores.masked_fill(mask == 0, float('-inf'))
+            # print("Mask applied.") # 打印方便調試
+
+        # 4. 計算注意力權重
+        # 在 SeqLen_K (最後一個維度) 上應用 Softmax
+        attention_weights = torch.softmax(scaled_qk_scores, dim=-1)
+
+        # 應用 Dropout (在計算出權重後)
+        attention_weights = self.dropout(attention_weights)
+
+        # 5. 將注意力權重與 Value 相乘
+        # 矩陣乘法: (Batch, SeqLen_Q, SeqLen_K) @ (Batch, SeqLen_K, Dim_v) -> (Batch, SeqLen_Q, Dim_v)
+        # 如果考慮 Heads: (Batch, Heads, SeqLen_Q, SeqLen_K) @ (Batch, Heads, SeqLen_K, Dim_v) -> (Batch, Heads, SeqLen_Q, Dim_v)
+        output = torch.matmul(attention_weights, v)
+
+        return output, attention_weights
+
+# %% [markdown]
+# ## 3. 示例使用
+#
+# 我們創建一些模擬的 Q, K, V 張量來演示 `ScaledDotProductAttention` 的工作。
+# 假設我們處理一個 Batch，Batch Size 為 2，序列長度為 5，向量維度為 64。
+# 在 Self-Attention 中，Q, K, V 來自同一個地方，並且通常 `SeqLen_Q == SeqLen_K == SeqLen_V` 且 `Dim_k == Dim_v`。
+# 這裡我們模擬單頭注意力，不包含 Heads 維度。
+
+# %%
+# 模擬輸入參數
+BATCH_SIZE = 2
+SEQ_LEN = 5 # 序列長度
+DIM_MODEL = 64 # 模型維度 (通常 Q, K, V 來自這裡)
+DIM_K = DIM_MODEL # Key 的維度通常等於模型維度或其一部分
+DIM_V = DIM_MODEL # Value 的維度通常等於模型維度或其一部分
+
+# 創建模擬的 Q, K, V 張量
+# 在實際 Transformer 中，Q, K, V 是通過對輸入 (例如詞嵌入 + 位置編碼) 進行線性變換 (全連接層) 得到的
+q_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, DIM_K).to(device) # (Batch, SeqLen_Q, Dim_k)
+k_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, DIM_K).to(device) # (Batch, SeqLen_K, Dim_k)
+v_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, DIM_V).to(device) # (Batch, SeqLen_V, Dim_v)
+
+# 實例化注意力模塊
+attention_module = ScaledDotProductAttention(dropout_p=0.1)
+attention_module.to(device)
+
+# 執行前向計算
+output, attention_weights = attention_module(q_tensor, k_tensor, v_tensor)
+
+print("使用模擬數據進行 Attention 計算:")
+print(f"Q 張量形狀: {q_tensor.shape}")
+print(f"K 張量形狀: {k_tensor.shape}")
+print(f"V 張量形狀: {v_tensor.shape}")
+print(f"\n注意力輸出形狀: {output.shape}") # 期望形狀同 V，但 SeqLen 是 SeqLen_Q -> (Batch, SeqLen_Q, Dim_v)
+print(f"注意力權重形狀: {attention_weights.shape}") # 期望形狀 (Batch, SeqLen_Q, SeqLen_K)
+
+# %% [markdown]
+# ## 4. 帶掩碼的示例使用 (Padding Mask)
+#
+# 在處理變長序列時，我們通常會對較短的序列進行 Padding，使其達到 Batch 中最長序列的長度，以便於 Batch 處理。Padding 的位置不應該參與 Attention 計算。我們可以使用一個掩碼來實現這一點。
+
+# %%
+# 模擬一個 Batch 中的兩個變長序列
+# 序列1: 5 個實際 token + 0 個 padding
+# 序列2: 3 個實際 token + 2 個 padding
+# Batch 中最長序列長度為 5
+
+# 實際 token 數量
+actual_seq_lengths = torch.tensor([5, 3]).to(device)
+
+# 創建一個 Padding Mask
+# Mask 的形狀應該是 (Batch, 1, 1, SeqLen_K) 或 (Batch, 1, SeqLen_Q, SeqLen_K)
+# 我們需要屏蔽掉 K 中 padding 的位置 (對應 Q 中的每個 token)
+# 這裡簡化為 SeqLen_Q == SeqLen_K
+mask = torch.arange(SEQ_LEN).unsqueeze(0).to(device) < actual_seq_lengths.unsqueeze(-1)
+# mask 應該是 (Batch, SeqLen) 的布爾張量
+# 例如，對於 Batch Size 2, SEQ_LEN 5:
+# [[ True, True, True, True, True],
+#  [ True, True, True, False, False]]
+
+# 為了應用到 scaled_qk_scores (Batch, SeqLen_Q, SeqLen_K)，我們需要擴展維度
+# 例如，擴展成 (Batch, 1, 1, SeqLen_K)
+mask = mask.unsqueeze(1).unsqueeze(2) # -> (Batch, 1, 1, SeqLen)
+
+print(f"\n生成的 Padding Mask (用於 K): {mask.shape}")
+print(mask) # 打印掩碼
+
+# 創建模擬的 Q, K, V 張量 (使用之前的)
+# q_tensor, k_tensor, v_tensor
+
+# 實例化注意力模塊
+attention_module_masked = ScaledDotProductAttention(dropout_p=0.1)
+attention_module_masked.to(device)
+
+# 執行前向計算，帶上掩碼
+output_masked, attention_weights_masked = attention_module_masked(q_tensor, k_tensor, v_tensor, mask=mask)
+
+print("\n使用帶 Padding Mask 的數據進行 Attention 計算:")
+print(f"注意力輸出形狀: {output_masked.shape}")
+print(f"注意力權重形狀: {attention_weights_masked.shape}")
+
+# 查看 Mask 後的注意力權重，可以看到被 Mask 的位置權重非常接近 0
+print("\n帶 Mask 的注意力權重示例 (Batch 1):")
+print(attention_weights_masked[0])
+print("\n帶 Mask 的注意力權重示例 (Batch 2):")
+print(attention_weights_masked[1])
+# 注意 Batch 2 中，Q 的每個 token (0-4) 對 K 的 padding 位置 (3, 4) 的權重都應該接近 0。
+# 這是因為 mask[:, :, :, 3] 和 mask[:, :, :, 4] 對 Batch 2 來說是 False (0)。
+
+
+# %% [markdown]
+# ## 總結與注意事項
+#
+# 這個範例展示了 Scaled Dot-Product Attention 的核心計算過程。在實際的 Transformer 或其他使用 Attention 的模型中，這個模塊會被用在 Multi-Head Attention 層內部。
+#
+# 如果 MOAI 實戰題讓你實現 Attention，很可能是類似這樣的單個模塊實現或在一個簡化的模型結構中應用 Attention。
+#
+# **準備這個主題的建議：**
+#
+# 1.  **理解概念:** 確保你完全理解 Q, K, V 的作用，Scaled 為什麼重要，Softmax 的作用，以及 Masking 的目的和應用場景 (Padding Mask 和 Causal Mask/Lookahead Mask)。
+# 2.  **掌握矩陣運算:** Attention 計算大量依賴矩陣乘法和轉置，確保你熟悉 PyTorch 或 NumPy 的相關操作以及維度變化。
+# 3.  **動手實踐:** 試着自己寫這個 `ScaledDotProductAttention` 模塊，並用不同的輸入形狀和 Mask 進行測試。
+# 4.  **了解上下文:** 這個 Scaled Dot-Product Attention 是 Multi-Head Attention 的基礎，Multi-Head Attention 是 Transformer 的基礎。理解它在整個模型中的位置和作用。
+# 5.  **預訓練模型使用:** 雖然範例是 Attention 實現，但再次強調，**使用預訓練模型進行 Fine-tuning** 可能是更常見的實戰考題形式。請務必熟練掌握 Hugging Face `transformers` 庫的基本使用流程（載入 tokenizer, 載入 model, 數據預處理, 訓練）。
+#
+# 熟練掌握這個 Scaled Dot-Product Attention 的實現細節，不僅能應對潛在的編程題，也能加深你對 Transformer 工作原理的理解，這對筆試也很有幫助。
