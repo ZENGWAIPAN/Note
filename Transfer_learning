@@ -1,0 +1,386 @@
+# %% [markdown]
+# # MOAI 2025 實戰範例：使用預訓練 ResNet 進行圖像分類微調
+#
+# 這個筆記本展示了如何應用遷移學習：
+# 1. 模擬創建一個小型圖像數據集 (按文件夾組織)。
+# 2. 使用 `torchvision.datasets.ImageFolder` 和 `transforms` 載入和預處理圖像數據。
+# 3. 載入在 ImageNet 上預訓練的 ResNet18 模型。
+# 4. 修改模型的最後分類層以適應新的類別數。
+# 5. 實現微調 (Fine-tuning) 策略：訓練部分或全部模型參數。
+# 6. 訓練和評估模型。
+
+# %% [markdown]
+# ## 1. 環境準備與庫引入
+# 請確保你已經安裝了 PyTorch 和 torchvision 庫。
+# 如果是本地環境，請使用 pip 安裝：
+# `pip install torch torchvision matplotlib pillow scikit-learn`
+# （Pillow 是 Python 圖像處理庫，通常是 torchvision 的依賴；scikit-learn 用於數據集分割）
+
+# %%
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, datasets, models # 引入 torchvision 相關模塊
+
+import numpy as np
+import random
+import os
+import shutil # 用於創建模擬文件夾結構
+
+import matplotlib.pyplot as plt # 用於可視化
+from PIL import Image # 用於圖像處理
+
+# 設定隨機數種子
+def set_seed(seed_value=42):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# 檢查是否有可用的 GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用的設備: {device}")
+
+
+# %% [markdown]
+# ## 2. 模擬創建小型圖像數據集
+#
+# `torchvision.datasets.ImageFolder` 要求數據按以下結構組織：
+# ```
+# root/class_a/xxx.png
+# root/class_a/xxy.png
+# root/class_b/123.png
+# root/class_b/abc.png
+# ...
+# ```
+# 我們模擬創建一個包含兩個類別（例如 'cat' 和 'dog'）的小型數據集。
+
+# %%
+# 模擬數據集的路徑和類別
+DATA_DIR = './simulated_dataset'
+TRAIN_DIR = os.path.join(DATA_DIR, 'train')
+VAL_DIR = os.path.join(DATA_DIR, 'val')
+CLASSES = ['cat', 'dog']
+NUM_SAMPLES_PER_CLASS_TRAIN = 20 # 每個類別的訓練樣本數
+NUM_SAMPLES_PER_CLASS_VAL = 10   # 每個類別的驗證樣本數
+IMAGE_SIZE = 64 # 模擬生成圖像的大小
+
+# 創建文件夾結構並生成模擬圖像文件
+if os.path.exists(DATA_DIR):
+    shutil.rmtree(DATA_DIR) # 如果已存在，先刪除
+
+os.makedirs(TRAIN_DIR, exist_ok=True)
+os.makedirs(VAL_DIR, exist_ok=True)
+
+def create_dummy_image(path, size=(IMAGE_SIZE, IMAGE_SIZE), color='white'):
+    """創建一個簡單的偽圖像文件"""
+    img = Image.new('RGB', size, color=color)
+    img.save(path)
+
+print("正在創建模擬數據集文件夾和圖像...")
+for cls in CLASSES:
+    os.makedirs(os.path.join(TRAIN_DIR, cls), exist_ok=True)
+    os.makedirs(os.path.join(VAL_DIR, cls), exist_ok=True)
+
+    # 生成訓練圖像
+    for i in range(NUM_SAMPLES_PER_CLASS_TRAIN):
+        img_path = os.path.join(TRAIN_DIR, cls, f'{cls}_{i:03d}.png')
+        # 給不同類別的圖像不同顏色以便區分，例如 cat=藍, dog=紅
+        color = (100, 150, 200) if cls == 'cat' else (200, 100, 100)
+        create_dummy_image(img_path, color=color)
+
+    # 生成驗證圖像
+    for i in range(NUM_SAMPLES_PER_CLASS_VAL):
+        img_path = os.path.join(VAL_DIR, cls, f'{cls}_{i:03d}.png')
+        color = (100, 150, 200) if cls == 'cat' else (200, 100, 100)
+        create_dummy_image(img_path, color=color)
+
+print(f"模擬數據集已創建在 {DATA_DIR}")
+print(f"訓練集總樣本數: {len(CLASSES) * NUM_SAMPLES_PER_CLASS_TRAIN}")
+print(f"驗證集總樣本數: {len(CLASSES) * NUM_SAMPLES_PER_CLASS_VAL}")
+
+# %% [markdown]
+# ## 3. 數據載入與預處理
+#
+# 使用 `ImageFolder` 從文件夾結構中讀取圖像和標籤。
+#
+# **重要：** 對於在 ImageNet 上預訓練的模型，需要使用 ImageNet 的**均值和標準差**進行標準化，並確保輸入圖像尺寸正確 (ResNet 通常是 224x224)。同時應用一些圖像增廣。
+
+# %%
+# 定義圖像轉換 (Transforms)
+# 訓練集轉換：通常包含數據增廣
+train_transforms = transforms.Compose([
+    transforms.Resize(256), # 首先縮放到一個較大的尺寸
+    transforms.RandomCrop(224), # 隨機裁剪到標準尺寸
+    transforms.RandomHorizontalFlip(), # 隨機水平翻轉
+    transforms.ToTensor(), # 將 PIL Image 轉換為 Tensor (自動縮放到 [0, 1])
+    # 使用 ImageNet 的均值和標準差進行標準化
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# 驗證集轉換：只進行必要的尺寸調整和標準化，不進行隨機增廣
+val_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224), # 中心裁剪到標準尺寸
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# 創建數據集實例
+train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=train_transforms)
+val_dataset = datasets.ImageFolder(VAL_DIR, transform=val_transforms)
+
+# 獲取類別名稱到索引的映射
+class_names = train_dataset.classes
+print(f"\n數據集類別: {class_names}")
+print(f"類別數量: {len(class_names)}")
+
+# 創建 DataLoader
+BATCH_SIZE = 8 # Batch Size
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2) # num_workers 可選，用於加速數據載入
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+print(f"訓練集 DataLoader 準備完成，Batch Size: {BATCH_SIZE}")
+print(f"驗證集 DataLoader 準備完成，Batch Size: {BATCH_SIZE}")
+
+# 查看一個 Batch 的數據結構
+inputs, classes = next(iter(train_loader))
+print("\n一個 Batch 的數據結構:")
+print(f"圖像 Batch shape: {inputs.shape}") # (batch_size, C, H, W) - C=3 for RGB
+print(f"標籤 Batch shape: {classes.shape}") # (batch_size,)
+
+
+# %% [markdown]
+# ## 4. 載入預訓練模型並修改分類器
+#
+# 使用 `torchvision.models` 載入 ResNet18，並用在 ImageNet 上預訓練的權重進行初始化。然後，替換最後的全連接層。
+
+# %%
+# 載入 ResNet18 預訓練模型
+# weights=ResNet18_Weights.IMAGENET1K_V1 表示載入在 ImageNet 上訓練好的權重
+model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+# ResNet18 的最後一層是全連接層 'fc'
+# 其輸入特徵數是固定的 (ResNet18 為 512)
+num_ftrs = model.fc.in_features # 獲取最後一層的輸入特徵數
+
+# 替換最後一層全連接層，使其輸出維度等於新的類別數量
+# 這裡 num_classes 就是 len(class_names)
+model.fc = nn.Linear(num_ftrs, len(class_names))
+
+# 將模型移動到指定的設備
+model.to(device)
+
+print("\n預訓練 ResNet18 模型載入完成，並修改了最後一層分類器。")
+# print(model) # 可以打印模型結構查看修改 (可選)
+
+
+# %% [markdown]
+# ## 5. 設定訓練策略：微調 (Fine-tuning)
+#
+# 對於微調，我們通常**解凍**預訓練模型的所有層，並使用一個**較低的學習率**進行訓練。
+
+# %%
+# 設定所有參數都需要計算梯度 (微調時通常如此)
+# 默認載入的預訓練模型參數 requires_grad 已經是 True
+# 如果是特徵提取，你會在這裡將大部分層的 requires_grad 設為 False
+for param in model.parameters():
+    param.requires_grad = True # 確保所有參數都可訓練 (微調)
+
+# 如果只做特徵提取，你可以這樣凍結除最後一層外的所有參數：
+# for param in model.parameters():
+#     param.requires_grad = False # 先凍結所有
+# for param in model.fc.parameters():
+#     param.requires_grad = True # 再只解凍最後一層
+
+# 定義損失函數和優化器
+criterion = nn.CrossEntropyLoss() # 圖像分類常用交叉熵損失
+
+# 對於微調，通常使用較低的學習率
+optimizer = optim.Adam(model.parameters(), lr=0.001) # 或 optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+
+# 可以使用學習率調度器來在訓練過程中降低學習率 (可選)
+# scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1) # 每 7 個 Epoch 將學習率乘以 0.1
+
+
+# %% [markdown]
+# ## 6. 訓練和評估循環
+#
+# 實現模型在訓練集上訓練並在驗證集上評估的過程。
+
+# %%
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10):
+    """
+    模型訓練函數
+    """
+    # from tqdm.auto import tqdm # 可選進度條
+
+    best_acc = 0.0 # 記錄最佳驗證準確率
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
+
+        # 每個 epoch 都進行訓練和驗證階段
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # 設定模型為訓練模式
+                dataloader = train_loader
+            else:
+                model.eval()   # 設定模型為評估模式
+                dataloader = val_loader
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # 遍歷數據
+            # dataloader_iter = tqdm(dataloader, desc=f'{phase} Epoch {epoch}') # 可選進度條
+            # for inputs, labels in dataloader_iter:
+            for inputs, labels in dataloader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                # 清零梯度
+                optimizer.zero_grad()
+
+                # 前向傳播
+                # 只有在訓練階段才追蹤梯度
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1) # 獲取預測類別索引
+                    loss = criterion(outputs, labels)
+
+                    # 後向傳播 + 優化 (只在訓練階段)
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # 統計
+                running_loss += loss.item() * inputs.size(0) # 累加 batch loss
+                running_corrects += torch.sum(preds == labels.data) # 累加 batch 正確數
+
+            # （可選）學習率調度
+            # if phase == 'train' and scheduler is not None:
+            #     scheduler.step()
+
+
+            epoch_loss = running_loss / len(dataloader.dataset)
+            epoch_acc = running_corrects.double() / len(dataloader.dataset)
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+            # 記錄歷史
+            if phase == 'train':
+                history['train_loss'].append(epoch_loss)
+                history['train_acc'].append(epoch_acc.item())
+            else:
+                history['val_loss'].append(epoch_loss)
+                history['val_acc'].append(epoch_acc.item())
+
+                # 判斷是否為最佳模型
+                if epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    # torch.save(model.state_dict(), 'best_model_weights.pth') # 保存最佳模型權重
+                    print(f'==> 驗證準確率提升至 {best_acc:.4f}, 保存模型權重 (如果需要)...')
+
+    print('\n訓練結束。')
+    print(f'最佳驗證準確率: {best_acc:.4f}')
+
+    return model, history
+
+# %% [markdown]
+# ## 7. 執行訓練
+#
+# 運行訓練過程。
+
+# %%
+# 設定訓練 Epoch 數量
+NUM_EPOCHS = 10 # 對於小型數據集和微調，10-25 個 Epoch 可能足夠
+
+print("\n開始執行模型訓練和評估...")
+
+# 開始訓練
+trained_model, training_history = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=NUM_EPOCHS)
+
+print("訓練過程歷史記錄:")
+print(training_history)
+
+# %% [markdown]
+# ## 8. 模型預測 (可選)
+#
+# 使用訓練好的模型對單個新圖像進行預測。
+
+# %%
+def predict_image(image_path, model, transforms, class_names, device):
+    """
+    對單個圖像文件進行預測。
+    """
+    model.eval() # 設定模型為評估模式
+
+    # 載入圖像
+    image = Image.open(image_path).convert('RGB') # 確保是 RGB 格式
+
+    # 應用與驗證集相同的轉換
+    image_tensor = transforms(image)
+
+    # 添加 Batch 維度 (模型期望 Batch 輸入)
+    image_tensor = image_tensor.unsqueeze(0)
+
+    # 將圖像移動到設備
+    image_tensor = image_tensor.to(device)
+
+    # 進行預測 (不計算梯度)
+    with torch.no_grad():
+        outputs = model(image_tensor) # 輸出 logits
+
+    # 獲取預測概率 (Softmax)
+    probabilities = torch.softmax(outputs, dim=1)
+
+    # 獲取預測類別索引和最高概率
+    max_prob, predicted_class_id = torch.max(probabilities, dim=1)
+
+    # 獲取預測類別名稱
+    predicted_class_name = class_names[predicted_class_id.item()]
+
+    return predicted_class_name, max_prob.item(), probabilities[0]
+
+# 創建一個新的模擬圖像文件用於測試
+test_img_path = './simulated_dataset/test_image.png'
+# 模擬一個 'cat' 圖像
+create_dummy_image(test_img_path, color=(120, 180, 220))
+print(f"\n創建了一個測試圖像文件: {test_img_path}")
+
+# 進行預測
+predicted_name, predicted_prob, all_probs = predict_image(
+    test_img_path, trained_model, val_transforms, class_names, device
+)
+
+print(f"\n對測試圖像 '{test_img_path}' 的預測結果:")
+print(f"預測類別: {predicted_name}")
+print(f"預測概率: {predicted_prob:.4f}")
+print(f"所有類別概率: {all_probs.tolist()}")
+
+# 清理模擬數據文件夾 (可選)
+# shutil.rmtree(DATA_DIR)
+# print(f"\n已刪除模擬數據集文件夾: {DATA_DIR}")
+
+# %% [markdown]
+# ## 9. 總結與注意事項
+#
+# 這個範例展示了使用預訓練 ResNet 進行圖像分類微調的完整流程。在 MOAI 比賽中，你需要根據實際數據集進行調整：
+#
+# 1.  **數據集:** 替換數據模擬部分，讀取比賽提供的真實圖像數據。確保文件夾結構符合 `ImageFolder` 的要求，或者自己編寫 Dataset 類來讀取。
+# 2.  **圖像預處理:** `transforms` 的設定非常重要。對於使用 ImageNet 預訓練權重的模型，`transforms.Resize`, `transforms.ToTensor`, `transforms.Normalize(mean, std)` 是必須的，確保均值和標準差使用 ImageNet 的值。訓練時添加適當的**圖像增廣**是提高模型性能的關鍵。
+# 3.  **模型選擇:** 比賽可能指定使用 ResNet 或 MobileNet。只需更改 `models.resnet18(...)` 為 `models.mobilenet_v2(...)` 或其他指定模型即可。記得檢查並修改其最後的分類層名稱 (ResNet 是 `.fc`，MobileNetV2 是 `.classifier[1]`)。
+# 4.  **訓練策略:** 微調和特徵提取各有優勢。如果時間充裕且數據集大小適中，微調通常效果更好。如果數據集很小或計算資源有限，特徵提取可能更可行。你需要根據比賽場景選擇合適的策略，並在代碼中體現（通過設置 `param.requires_grad`）。
+# 5.  **超參數:** `BATCH_SIZE`, `NUM_EPOCHS`, `learning rate` 都需要根據數據集大小和計算資源進行調整。微調的學習率通常比從零訓練要低。
+# 6.  **評估指標:** 除了準確率，還可以計算 Precision, Recall, F1-Score 等。
+# 7.  **計算資源:** 訓練圖像模型，特別是微調預訓練模型，非常依賴 GPU。確保你的 Kaggle 環境正確設置了 GPU。
+#
+# 理解遷移學習的原理和如何在 PyTorch 中實現微調是應對這類考題的關鍵。
