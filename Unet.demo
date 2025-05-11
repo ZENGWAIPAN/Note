@@ -1,0 +1,579 @@
+# %% [markdown]
+# # MOAI 2025 實戰範例：基於 U-Net 的圖像分割
+
+# %% [markdown]
+# ## 1. 環境準備與庫引入
+# 請確保你已經安裝了 PyTorch 和其他必要的庫。
+# 如果是本地環境，請使用 pip 安裝：
+# `pip install torch numpy scikit-image matplotlib`
+# （scikit-image 用於圖像處理，matplotlib 用於可視化）
+
+# %%
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+
+import numpy as np
+import random
+import os
+import math # 用於生成圓形
+from skimage.draw import circle, disk # 從 scikit-image 引入繪製函數
+from skimage.transform import resize # 可能用於調整生成圖像大小
+import matplotlib.pyplot as plt # 用於可視化
+
+# 設定隨機數種子，確保結果可重現
+def set_seed(seed_value=42):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value) # 如果使用GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# 檢查是否有可用的 GPU，並設定設備
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用的設備: {device}")
+
+# %% [markdown]
+# ## 2. 數據生成 (模擬)
+#
+# 我們創建一個函數來生成簡單的灰度圖像和對應的二值掩碼。
+
+# %%
+def generate_circle_image(image_size=64, min_radius=5, max_radius=15):
+    """
+    生成一個包含隨機圓形的灰度圖像和其二值掩碼。
+    """
+    image = np.zeros((image_size, image_size), dtype=np.float32) # 灰度圖像
+    mask = np.zeros((image_size, image_size), dtype=np.long)     # 掩碼 (0:背景, 1:圓形)
+
+    # 隨機生成圓心和半徑
+    radius = random.randint(min_radius, max_radius)
+    center_row = random.randint(radius, image_size - radius)
+    center_col = random.randint(radius, image_size - radius)
+
+    # 繪製圓形
+    # skimage.draw.circle 返回圓形邊緣的像素坐標
+    # skimage.draw.disk 返回填充圓形的像素坐標
+    rr, cc = disk((center_row, center_col), radius, shape=image.shape)
+
+    # 在圖像上繪製圓形 (給像素一個非零值，例如 1.0 或隨機亮度)
+    image[rr, cc] = 1.0 # 簡單設定為白色 (最大亮度)
+
+    # 在掩碼上標記圓形區域 (標籤為 1)
+    mask[rr, cc] = 1 # 設定為類別 1 (前景)
+
+    # 將圖像維度調整為 (C, H, W)，對於灰度圖 C=1
+    image = np.expand_dims(image, axis=0) # 從 (H, W) -> (1, H, W)
+
+    return image, mask
+
+# 生成多個圖像和掩碼
+def create_synthetic_dataset(num_samples=100, image_size=64):
+    images = []
+    masks = []
+    for _ in range(num_samples):
+        img, mask = generate_circle_image(image_size=image_size)
+        images.append(img)
+        masks.append(mask)
+    return np.array(images), np.array(masks) # 轉換為 numpy 數組
+
+# 生成一個小型數據集
+DATASET_SIZE = 200
+IMAGE_SIZE = 64
+images_np, masks_np = create_synthetic_dataset(num_samples=DATASET_SIZE, image_size=IMAGE_SIZE)
+
+print(f"生成的圖像數量: {images_np.shape[0]}") # (N, 1, H, W)
+print(f"圖像維度: {images_np.shape}")
+print(f"掩碼維度: {masks_np.shape}") # (N, H, W)
+
+# 顯示一個示例
+plt.figure(figsize=(8, 4))
+plt.subplot(1, 2, 1)
+plt.imshow(images_np[0, 0], cmap='gray') # 顯示第一個圖像的灰度通道
+plt.title("示例圖像")
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+plt.imshow(masks_np[0], cmap='gray') # 顯示第一個掩碼
+plt.title("示例掩碼")
+plt.axis('off')
+plt.show()
+
+# 將 numpy 數組轉換為 PyTorch Tensor
+images_tensor = torch.tensor(images_np, dtype=torch.float32)
+masks_tensor = torch.tensor(masks_np, dtype=torch.long)
+
+# %% [markdown]
+# ## 3. 創建 PyTorch Dataset 和 DataLoader
+#
+# 將圖像和掩碼打包成 Dataset，並創建 DataLoader。
+
+# %%
+class SegmentationDataset(Dataset):
+    def __init__(self, images, masks):
+        self.images = images
+        self.masks = masks
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        # 確保圖像和掩碼是 PyTorch Tensor 並在正確的設備上 (後續在 DataLoader 中處理)
+        # return torch.tensor(self.images[idx], dtype=torch.float32), torch.tensor(self.masks[idx], dtype=torch.long)
+        return self.images[idx], self.masks[idx] # 數據已經是 tensor 了
+
+# 創建 Dataset 實例
+full_dataset = SegmentationDataset(images_tensor, masks_tensor)
+
+# 劃分訓練集和驗證集 (例如 8:2)
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+# 設定 DataLoader 的 Batch Size
+BATCH_SIZE = 8
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print("\n數據載入完成。")
+print(f"訓練集大小: {len(train_dataset)}")
+print(f"驗證集大小: {len(val_dataset)}")
+print(f"每個 Batch 大小: {BATCH_SIZE}")
+
+# 查看一個 batch 的數據結構
+batch_images, batch_masks = next(iter(train_loader))
+print("\n一個 Batch 的數據結構:")
+print(f"圖像 Batch shape: {batch_images.shape}") # (batch_size, C, H, W)
+print(f"掩碼 Batch shape: {batch_masks.shape}")   # (batch_size, H, W)
+
+
+# %% [markdown]
+# ## 4. 定義 U-Net 模型
+#
+# 實現 U-Net 的各個模塊和整體結構。
+
+# %%
+# 定義 U-Net 中的基本雙卷積塊
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+# 定義 U-Net 中的下採樣塊 (Encoder)
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool = nn.MaxPool2d(2) # 2x2 最大池化，步長為 2
+        self.double_conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x):
+        return self.double_conv(self.maxpool(x))
+
+# 定義 U-Net 中的上採樣塊 (Decoder)
+class Up(nn.Module):
+    """Upscaling then double conv"""
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+
+        # 如果使用雙線性插值進行上採樣，否則使用轉置卷積 (ConvTranspose2d)
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2) # 跳躍連接後的通道數需要計算
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels) # 跳躍連接後的通道數是 in_channels
+
+    def forward(self, x1, x2):
+        # x1 是來自下層的上採樣輸出
+        # x2 是來自編碼器對應層的跳躍連接輸出
+
+        x1 = self.up(x1) # 上採樣 x1
+
+        # [Optional] 如果需要，可以裁剪 x2 使其與 x1 的大小匹配
+        # 如果在下採樣和上採樣中使用相同的 padding 和 stride 設置，大小通常會匹配
+        # diffY = x2.size()[2] - x1.size()[2]
+        # diffX = x2.size()[3] - x1.size()[3]
+        # x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+        #                 diffY // 2, diffY - diffY // 2])
+        # 或者使用其他裁剪方法
+
+        # 將上採樣後的 x1 與跳躍連接的 x2 在通道維度上拼接
+        x = torch.cat([x2, x1], dim=1) # dim=1 是通道維度
+        return self.conv(x)
+
+# 定義 U-Net 的輸出層 (1x1 卷積)
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+# 完整的 U-Net 模型
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels # 輸入通道數 (灰度圖為 1)
+        self.n_classes = n_classes   # 輸出類別數 (前景/背景為 2)
+        self.bilinear = bilinear     # 是否使用雙線性插值上採樣
+
+        # 編碼器 (下採樣路徑)
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        # 可選: 更深的 U-Net
+        # self.down4 = Down(512, 1024 // (2 if bilinear else 1))
+
+        # 解碼器 (上採樣路徑)
+        # self.up4 = Up(1024, 512 // (2 if bilinear else 1), bilinear) # 如果有 down4
+        self.up3 = Up(512 + 256, 256 // (2 if bilinear else 1), bilinear) # 512是從下面上採樣，256是跳躍連接
+        self.up2 = Up(256 + 128, 128 // (2 if bilinear else 1), bilinear)
+        self.up1 = Up(128 + 64, 64, bilinear)
+
+        # 輸出層
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        # 編碼器
+        x1 = self.inc(x)     # 輸出: (C, H, W) -> (64, H, W)
+        x2 = self.down1(x1)  # 輸出: (64, H, W) -> (128, H/2, W/2)
+        x3 = self.down2(x2)  # 輸出: (128, H/2, W/2) -> (256, H/4, W/4)
+        x4 = self.down3(x3)  # 輸出: (256, H/4, W/4) -> (512, H/8, W/8)
+        # x5 = self.down4(x4) # 輸出: (512, H/8, W/8) -> (1024, H/16, W/16)
+
+        # 解碼器 (注意跳躍連接的順序，從最底層開始上採樣)
+        # x = self.up4(x5, x4) # 從 x5 上採樣，與 x4 拼接
+        x = self.up3(x4, x3) # 從 x4 上採樣，與 x3 拼接
+        x = self.up2(x, x2)  # 從上一步輸出上採樣，與 x2 拼接
+        x = self.up1(x, x1)  # 從上一步輸出上採樣，與 x1 拼接
+
+        # 輸出層
+        logits = self.outc(x) # 輸出: (64, H, W) -> (n_classes, H, W)
+
+        return logits # 返回未經過 Softmax 的原始分數 (logits)
+
+# 實例化 U-Net 模型
+# 輸入通道數為 1 (灰度圖)，輸出類別數為 2 (背景/前景)
+model = UNet(n_channels=1, n_classes=2)
+model.to(device) # 將模型移動到設備
+
+print("\nU-Net 模型定義完成。")
+# print(f"模型結構:\n{model}") # 如果想看詳細結構可以取消註釋
+
+# %% [markdown]
+# ## 5. 設定損失函數和優化器
+#
+# 對於像素級別的多類別分類，常用的損失函數是交叉熵損失 (`CrossEntropyLoss`)。
+# 也可以使用結合了 Dice 或 IoU 的損失函數，這在圖像分割中通常效果更好，但 `CrossEntropyLoss` 是最基礎和通用的選擇。
+
+# %%
+# 定義損失函數
+# nn.CrossEntropyLoss() 結合了 nn.LogSoftmax() 和 nn.NLLLoss()
+# 期望模型的輸出是 (N, C, H, W)，其中 C 是類別數
+# 期望標籤是 (N, H, W)，其中每個像素的值是類別索引 (0 到 C-1)
+criterion = nn.CrossEntropyLoss()
+
+# 定義優化器
+optimizer = optim.Adam(model.parameters(), lr=1e-4) # Adam 是一個不錯的選擇
+
+# %% [markdown]
+# ## 6. 模型訓練函數
+#
+# 實現單個 epoch 的訓練邏輯。
+
+# %%
+def train_epoch(model, data_loader, criterion, optimizer, device):
+    """
+    單個 epoch 的訓練函數
+    """
+    model.train() # 設定模型為訓練模式
+    running_loss = 0.0
+
+    # 使用 tqdm 顯示進度條 (可選，需要安裝 tqdm: pip install tqdm)
+    # from tqdm.auto import tqdm
+    # data_loader = tqdm(data_loader, desc='Training')
+
+    for images, masks in data_loader:
+        # 將數據移動到設備
+        images = images.to(device)
+        masks = masks.to(device) # 掩碼是 (N, H, W)
+
+        # 清零梯度
+        optimizer.zero_grad()
+
+        # 前向傳播
+        outputs = model(images) # 輸出是 (N, C, H, W)
+
+        # 計算損失
+        loss = criterion(outputs, masks) # 將 logits 和 masks 傳入損失函數
+
+        # 反向傳播
+        loss.backward()
+
+        # 更新參數
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0) # 累積每個 batch 的總損失
+
+    epoch_loss = running_loss / len(data_loader.dataset)
+    return epoch_loss
+
+# %% [markdown]
+# ## 7. 模型評估函數
+#
+# 實現單個 epoch 的評估邏輯。計算損失、像素準確率和 IoU。
+
+# %%
+def calculate_metrics(preds, masks, num_classes):
+    """
+    計算像素準確率和每個類別的 IoU
+    preds: 預測的類別掩碼 (N, H, W)
+    masks: 真實的類別掩碼 (N, H, W)
+    num_classes: 類別總數
+    """
+    # 將預測和真實標籤展平為一維數組
+    preds = preds.view(-1)
+    masks = masks.view(-1)
+
+    # 計算像素準確率
+    correct_pixels = (preds == masks).sum().item()
+    total_pixels = masks.numel()
+    pixel_accuracy = correct_pixels / total_pixels if total_pixels > 0 else 0
+
+    # 計算 IoU (Intersection over Union)
+    iou_list = []
+    for cls_id in range(num_classes):
+        # 找到屬於當前類別的像素
+        pred_pixels = (preds == cls_id)
+        mask_pixels = (masks == cls_id)
+
+        # 計算交集 (Intersection)
+        intersection = (pred_pixels & mask_pixels).sum().item()
+
+        # 計算並集 (Union)
+        # Union = (預測為該類別的像素數) + (真實為該類別的像素數) - Intersection
+        union = pred_pixels.sum().item() + mask_pixels.sum().item() - intersection
+
+        # 避免除以零
+        iou = intersection / union if union > 0 else float('nan') # 如果該類別不存在於預測或真實中，IoU 為 NaN
+        iou_list.append(iou)
+
+    # 計算平均 IoU (忽略 NaN 值)
+    iou_array = np.array(iou_list)
+    mean_iou = np.nanmean(iou_array) # 忽略 NaN 計算平均值
+
+    return pixel_accuracy, iou_list, mean_iou
+
+def evaluate(model, data_loader, criterion, device, num_classes):
+    """
+    在驗證集上評估模型性能
+    """
+    model.eval() # 設定模型為評估模式
+    running_loss = 0.0
+    all_preds = []
+    all_masks = []
+
+    # 不計算梯度
+    with torch.no_grad():
+        # from tqdm.auto import tqdm
+        # data_loader = tqdm(data_loader, desc='Evaluating')
+
+        for images, masks in data_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+
+            running_loss += loss.item() * images.size(0)
+
+            # 獲取預測結果 (每個像素的類別索引)
+            # outputs 是 (N, C, H, W)，argmax 在通道維度 (dim=1) 找到最大值索引
+            preds = torch.argmax(outputs, dim=1) # 輸出是 (N, H, W)
+
+            all_preds.append(preds.cpu())
+            all_masks.append(masks.cpu()) # 將真實標籤也移回 CPU 進行計算
+
+    epoch_loss = running_loss / len(data_loader.dataset)
+
+    # 將所有 Batch 的預測和真實掩碼拼接起來
+    all_preds = torch.cat(all_preds, dim=0)
+    all_masks = torch.cat(all_masks, dim=0)
+
+    # 計算總體指標
+    pixel_accuracy, iou_list, mean_iou = calculate_metrics(all_preds, all_masks, num_classes)
+
+    return epoch_loss, pixel_accuracy, iou_list, mean_iou
+
+# %% [markdown]
+# ## 8. 執行訓練和評估
+#
+# 運行多個 Epoch 的訓練和評估。
+
+# %%
+EPOCHS = 10 # 對於簡單的模擬數據集，10-20 個 Epoch 可能就夠了
+NUM_CLASSES = 2 # 背景和前景兩個類別
+
+best_val_iou = -1 # 記錄最佳驗證 IoU
+history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_iou': []}
+
+print("\n開始訓練...")
+
+for epoch in range(EPOCHS):
+    print(f"\nEpoch {epoch+1}/{EPOCHS}")
+    print("-" * 10)
+
+    # 訓練
+    train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+    print(f"訓練損失: {train_loss:.4f}")
+
+    # 評估
+    val_loss, val_acc, val_iou_list, val_mean_iou = evaluate(model, val_loader, criterion, device, NUM_CLASSES)
+
+    print(f"驗證損失: {val_loss:.4f}")
+    print(f"驗證像素準確率: {val_acc:.4f}")
+    print(f"驗證類別 IoU: {val_iou_list}") # 打印每個類別的 IoU
+    print(f"驗證平均 IoU (Mean IoU): {val_mean_iou:.4f}")
+
+
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_acc)
+    history['val_iou'].append(val_mean_iou)
+
+    # 根據平均 IoU 保存最佳模型
+    if val_mean_iou > best_val_iou:
+        best_val_iou = val_mean_iou
+        # torch.save(model.state_dict(), 'best_unet_state_dict.pth') # 保存模型權重
+        print("驗證集平均 IoU 提升，保存模型權重 (如果需要)...")
+
+
+print("\n訓練結束。")
+print(f"最佳驗證平均 IoU: {best_val_iou:.4f}")
+
+# %% [markdown]
+# ## 9. 模型預測與可視化 (可選)
+#
+# 使用訓練好的模型對新圖像進行預測，並可視化結果。
+
+# %%
+def predict_and_visualize(image, model, device):
+    """
+    對單個圖像進行預測，並可視化原始圖像、真實掩碼 (如果提供) 和預測掩碼。
+    image: 輸入圖像，numpy 數組 (H, W) 或 torch tensor (1, H, W) 或 (C, H, W)
+    model: 訓練好的模型
+    device: 使用的設備
+    """
+    model.eval() # 設定模型為評估模式
+
+    # 確保輸入是 PyTorch Tensor 並有 Batch 和 Channel 維度
+    if isinstance(image, np.ndarray):
+        # 如果是 numpy 數組，確保是浮點型，並添加 Batch 和 Channel 維度
+        img_tensor = torch.tensor(image, dtype=torch.float32)
+        if img_tensor.ndim == 2: # (H, W)
+             img_tensor = img_tensor.unsqueeze(0) # (1, H, W)
+        if img_tensor.ndim == 3 and img_tensor.shape[0] != model.n_channels: # (H, W, C) or (C, H, W) incorrect C
+             img_tensor = img_tensor.permute(2, 0, 1) if img_tensor.shape[-1] == model.n_channels else img_tensor.unsqueeze(0) # 假設是 (H, W, C) 或需要加通道
+        if img_tensor.ndim == 3 and img_tensor.shape[0] == model.n_channels: # (C, H, W)
+            pass # 格式正確
+        img_tensor = img_tensor.unsqueeze(0) # 添加 Batch 維度: (1, C, H, W)
+
+    elif isinstance(image, torch.Tensor):
+         img_tensor = image.clone().detach() # 複製並分離
+         if img_tensor.ndim == 2: # (H, W)
+             img_tensor = img_tensor.unsqueeze(0) # (1, H, W)
+         if img_tensor.ndim == 3 and img_tensor.shape[0] != model.n_channels: # (H, W, C) or (C, H, W) incorrect C
+             img_tensor = img_tensor.permute(2, 0, 1) if img_tensor.shape[-1] == model.n_channels else img_tensor.unsqueeze(0) # 假設是 (H, W, C) 或需要加通道
+         if img_tensor.ndim == 3 and img_tensor.shape[0] == model.n_channels: # (C, H, W)
+            pass # 格式正確
+         img_tensor = img_tensor.unsqueeze(0) # 添加 Batch 維度: (1, C, H, W)
+
+    else:
+        raise TypeError("Input must be numpy array or torch tensor")
+
+
+    img_tensor = img_tensor.to(device) # 將圖像移動到設備
+
+    with torch.no_grad():
+        outputs = model(img_tensor) # 輸出 (1, C, H, W)
+
+    # 獲取預測掩碼
+    # argmax 在通道維度上，結果是 (1, H, W)
+    predicted_mask = torch.argmax(outputs, dim=1).squeeze(0) # 移除 Batch 維度，得到 (H, W)
+
+    # 將結果移回 CPU 並轉換為 numpy
+    predicted_mask_np = predicted_mask.cpu().numpy()
+
+    # 可視化
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    # 原始圖像 (取第一個通道顯示灰度)
+    # 如果原始輸入是 numpy 數組 (H, W)，直接顯示
+    if isinstance(image, np.ndarray) and image.ndim == 2:
+         axes[0].imshow(image, cmap='gray')
+    # 如果原始輸入是 numpy 數組 (1, H, W)，取第一個通道顯示
+    elif isinstance(image, np.ndarray) and image.ndim == 3 and image.shape[0] == 1:
+         axes[0].imshow(image[0], cmap='gray')
+    # 如果原始輸入是 tensor，轉回 numpy 顯示第一個通道
+    else: # 處理 tensor 或其他 numpy 格式
+        axes[0].imshow(img_tensor.squeeze(0).cpu().numpy()[0], cmap='gray')
+
+
+    axes[0].set_title("原始圖像")
+    axes[0].axis('off')
+
+    # 預測掩碼
+    axes[1].imshow(predicted_mask_np, cmap='gray') # 顯示二值掩碼
+    axes[1].set_title("預測掩碼")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# 從驗證集中隨機選擇一個圖像進行預測
+random_index = random.randint(0, len(val_dataset) - 1)
+sample_image, sample_mask = val_dataset[random_index] # 獲取一個圖像-掩碼對 (tensor)
+
+print("\n預測一個驗證集樣本:")
+predict_and_visualize(sample_image, model, device)
+
+
+# 也可以生成一個全新的圖像進行測試
+print("\n預測一個全新生成的樣本:")
+new_image_np, _ = generate_circle_image(image_size=IMAGE_SIZE) # 只生成圖像，掩碼不是必須的
+predict_and_visualize(new_image_np[0], model, device) # 傳入 (H, W) numpy 數組
+
+# %% [markdown]
+# ## 總結與注意事項
+#
+# 這個範例展示了如何從數據準備到訓練和評估一個 U-Net 模型進行圖像分割。在 MOAI 比賽中遇到圖像分割問題時，你可以參考這個結構進行修改：
+#
+# 1.  **真實數據集：** 比賽會提供真實的圖像數據集，你不能再生成模擬數據。你需要學會讀取圖像文件（如 `.png`, `.jpg`）和掩碼文件。常用的庫是 `PIL` (Pillow), `cv2` (OpenCV), 或 `scikit-image`。掩碼文件可能有多種格式（如灰度圖，其中像素值代表類別索引；或者每個類別一個單獨的二值掩碼；或者使用顏色表示類別）。你需要根據比賽說明處理好這些。
+# 2.  **數據增廣：** 對於圖像任務，數據增廣（如隨機旋轉、翻轉、縮放、裁剪）非常重要，特別是在數據量不大的情況下。這有助於提高模型的泛化能力。`torchvision.transforms` 或 `albumentations` 是常用的數據增廣庫。請注意，對圖像進行增廣時，對應的掩碼也必須進行同樣的變換。
+# 3.  **模型修改：** U-Net 有不同的變體。你可以調整網絡的深度（增加或減少 Down/Up 塊）、每一層的通道數。如果輸入圖像不是灰度圖（例如是 RGB），你需要將 `n_channels` 改為 3。如果分割的類別超過 2 個（例如同時分割不同種類的物體），你需要將 `n_classes` 改為對應的類別數。
+# 4.  **損失函數：** 對於不平衡的類別分佈（例如，前景物體像素遠少於背景像素），`CrossEntropyLoss` 可能效果不佳。可以考慮使用加權交叉熵損失、Dice Loss、Focal Loss 或它們的組合。Dice Loss 和 IoU Loss 與評估指標直接相關，通常能帶來更好的分割結果。
+# 5.  **評估指標：** 像素準確率可能具有誤導性（如果背景佔絕大多數）。IoU (Intersection over Union) 和 Dice Coefficient 是更標準的圖像分割評估指標，它們衡量預測區域與真實區域的重疊程度。在實戰中，你需要實現或使用庫（如 `torchmetrics` 或自己實現）來計算這些指標。
+# 6.  **預訓練權重：** 對於真實圖像數據集，特別是規模較小時，可以考慮使用在大型圖像分類任務上預訓練的網絡（如 ResNet, MobileNet）作為 U-Net 編碼器的骨幹網絡，然後在其基礎上構建解碼器。這屬於遷移學習的範疇，通常能加速訓練並提高性能。然而，MOAI Syllabus 雖然提到了遷移學習，但 U-Net 部分可能更側重於其結構本身，具體是否需要結合預訓練骨幹網絡取決於比賽難度和數據集。
+# 7.  **超參數調整：** 學習率、Batch Size、Epoch 數量、優化器類型等都需要根據實際數據集進行調優。
+# 8.  **計算資源：** U-Net 相對較大，訓練需要 GPU。確保你的環境支持 GPU。
